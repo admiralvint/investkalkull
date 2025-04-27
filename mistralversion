@@ -1,0 +1,766 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import tkinter.font as tkfont
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import csv
+import copy
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Tuple, Optional, Any
+import io
+import traceback
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Constants
+PROCESSING_FEE: float = 3000.0
+DIVIDEND_TAX_RATE: float = 0.22
+
+DEFAULT_VALUES = {
+    "PROP_VALUE": "391000",
+    "PROP_GROWTH": "3",
+    "INIT_OWN": "58650",
+    "ADD_OWN": "100000",
+    "DURATION": "30",
+    "ANNUAL_RATE": "3.5",
+    "ETF_INITIAL": "100000",
+    "ETF_GROWTH_FULL": "7",
+    "ETF_GROWTH_DIV": "5",
+    "ETF_DIVIDEND": "2"
+}
+
+@dataclass
+class SimulationResult:
+    Year: int
+    PropertyValue: float = 0.0
+    LoanBalance: float = 0.0
+    MonthlyPayment: float = 0.0
+    AnnualInterest: float = 0.0
+    ETFValue: float = 0.0
+    ETFGrowth: float = 0.0
+    GrossDividend: float = 0.0
+    DividendIncome: float = 0.0
+    NetEquity: float = 0.0
+    TotalInterest: Optional[float] = field(default=None, compare=False)
+
+ScenarioResults = List[SimulationResult]
+
+def pmt(annual_rate: float, n_years: float, principal: float) -> float:
+    """Calculate the monthly payment using the annuity formula."""
+    if principal <= 0 or n_years <= 0:
+        return 0.0
+    monthly_rate = annual_rate / 100 / 12
+    n_months = n_years * 12
+    if monthly_rate == 0:
+        return principal / n_months
+    try:
+        payment = principal * (monthly_rate * (1 + monthly_rate) ** n_months) / (((1 + monthly_rate) ** n_months) - 1)
+    except OverflowError:
+        messagebox.showerror("Calculation Error", "Overflow occurred calculating monthly payment. Check inputs (rate/duration too high?).")
+        return float('inf')
+    except ZeroDivisionError:
+        return float('inf')
+    return payment
+
+def remaining_balance(principal: float, annual_rate: float, total_years: float, elapsed_years: float) -> float:
+    """Calculate the remaining loan balance after elapsed_years using financial formula."""
+    if principal <= 0 or total_years <= 0:
+        return 0.0
+    monthly_rate = annual_rate / 100 / 12
+    n = total_years * 12
+    m = elapsed_years * 12
+    if m >= n: return 0.0
+    if monthly_rate == 0:
+        return principal * (1 - m / n) if n > 0 else principal
+    try:
+        numerator = (1 + monthly_rate) ** n - (1 + monthly_rate) ** m
+        denominator = ((1 + monthly_rate) ** n) - 1
+        if denominator == 0:
+            return principal
+        balance = principal * (numerator / denominator)
+    except OverflowError:
+        messagebox.showerror("Calculation Error", "Overflow occurred calculating remaining balance. Check inputs.")
+        return float('inf')
+    return max(0.0, balance)
+
+def property_value(initial_value: float, growth_percent: float, years: int) -> float:
+    """Calculate the property value after a given number of years."""
+    if years < 0: return initial_value
+    return initial_value * ((1 + growth_percent / 100) ** years)
+
+def simulate_scenario_1(loan_years: float, prop0: float, prop_growth: float, full_loan: float, add_own: float, annual_rate: float) -> ScenarioResults:
+    """Scenario 1: Loan reduction via a one-time additional payment."""
+    effective_loan = max(0.0, full_loan - add_own)
+    simulation_duration_years = int(loan_years)
+    fixed_payment = pmt(annual_rate, loan_years, effective_loan)
+    results: ScenarioResults = []
+    total_interest: float = 0.0
+    current_loan_balance = effective_loan
+
+    for year in range(1, simulation_duration_years + 1):
+        pv = property_value(prop0, prop_growth, year)
+        lb_end_year = 0.0
+        annual_int = 0.0
+        monthly_payment_this_year = 0.0
+
+        if effective_loan > 0:
+            lb_end_year = remaining_balance(effective_loan, annual_rate, loan_years, year)
+            lb_begin_year = current_loan_balance
+            avg_balance = (lb_begin_year + lb_end_year) / 2
+            annual_int = avg_balance * (annual_rate / 100)
+            total_interest += annual_int
+            monthly_payment_this_year = fixed_payment if lb_begin_year > 1e-2 else 0.0
+        else:
+            lb_end_year = 0.0
+            annual_int = 0.0
+            monthly_payment_this_year = 0.0
+
+        net_equity = pv - lb_end_year
+        results.append(SimulationResult(
+            Year=year,
+            PropertyValue=pv,
+            LoanBalance=lb_end_year,
+            MonthlyPayment=monthly_payment_this_year,
+            AnnualInterest=annual_int,
+            NetEquity=net_equity
+        ))
+        if effective_loan > 0:
+            current_loan_balance = lb_end_year
+
+    if results:
+        results[-1].TotalInterest = total_interest
+    return results
+
+def simulate_scenario_2(loan_years: float, prop0: float, prop_growth: float, full_loan: float, annual_rate: float, etf_initial: float, etf_growth: float, dividend_yield: float) -> ScenarioResults:
+    """Scenario 2: ETF reinvestment (full loan is used)."""
+    effective_loan = max(0.0, full_loan)
+    simulation_duration_years = int(loan_years)
+    fixed_payment = pmt(annual_rate, loan_years, effective_loan)
+    results: ScenarioResults = []
+    total_interest: float = 0.0
+    combined_factor = (1 + etf_growth / 100.0) * (1 + dividend_yield / 100.0)
+    current_loan_balance = effective_loan
+    current_etf_value = etf_initial
+
+    for year in range(1, simulation_duration_years + 1):
+        pv = property_value(prop0, prop_growth, year)
+        lb_end_year = 0.0
+        annual_int = 0.0
+        monthly_payment_this_year = 0.0
+
+        if effective_loan > 0:
+            lb_end_year = remaining_balance(effective_loan, annual_rate, loan_years, year)
+            lb_begin_year = current_loan_balance
+            avg_balance = (lb_begin_year + lb_end_year) / 2
+            annual_int = avg_balance * (annual_rate / 100.0)
+            total_interest += annual_int
+            monthly_payment_this_year = fixed_payment if lb_begin_year > 1e-2 else 0.0
+        else:
+            lb_end_year = 0.0
+            annual_int = 0.0
+            monthly_payment_this_year = 0.0
+
+        gross_dividend_this_year = current_etf_value * (dividend_yield / 100.0)
+        capital_growth_amount = current_etf_value * (etf_growth / 100.0)
+        current_etf_value += capital_growth_amount + gross_dividend_this_year
+
+        net_equity = pv - lb_end_year + current_etf_value
+        results.append(SimulationResult(
+            Year=year,
+            PropertyValue=pv,
+            LoanBalance=lb_end_year,
+            MonthlyPayment=monthly_payment_this_year,
+            AnnualInterest=annual_int,
+            ETFValue=current_etf_value,
+            ETFGrowth=capital_growth_amount,
+            GrossDividend=gross_dividend_this_year,
+            NetEquity=net_equity
+        ))
+        if effective_loan > 0:
+            current_loan_balance = lb_end_year
+
+    if results:
+        results[-1].TotalInterest = total_interest
+    return results
+
+def simulate_scenario_3(loan_years: float, prop0: float, prop_growth: float, full_loan: float, annual_rate: float, etf_initial: float, etf_growth: float, dividend_yield: float) -> ScenarioResults:
+    """Scenario 3: ETF dividend-based loan reduction, switching to reinvestment."""
+    effective_loan = max(0.0, full_loan)
+    if effective_loan <= 1e-2:
+        simulation_duration_years = int(loan_years)
+        results_no_loan: ScenarioResults = []
+        current_etf_value_no_loan = etf_initial
+        etf_growth_rate = etf_growth / 100.0
+        dividend_rate = dividend_yield / 100.0
+
+        for year in range(1, simulation_duration_years + 1):
+            pv = property_value(prop0, prop_growth, year)
+            capital_growth_amount = current_etf_value_no_loan * etf_growth_rate
+            gross_dividend = current_etf_value_no_loan * dividend_rate
+            current_etf_value_no_loan += capital_growth_amount + gross_dividend
+
+            results_no_loan.append(SimulationResult(
+                Year=year,
+                PropertyValue=pv,
+                LoanBalance=0.0,
+                MonthlyPayment=0.0,
+                AnnualInterest=0.0,
+                ETFValue=current_etf_value_no_loan,
+                ETFGrowth=capital_growth_amount,
+                GrossDividend=gross_dividend,
+                NetEquity=pv + current_etf_value_no_loan,
+                TotalInterest=0.0
+            ))
+        if results_no_loan: results_no_loan[-1].TotalInterest = 0.0
+        return results_no_loan
+
+    total_months = int(loan_years * 12)
+    fixed_payment = pmt(annual_rate, loan_years, effective_loan)
+    monthly_rate = annual_rate / 100.0 / 12.0
+    current_balance = effective_loan
+    results: ScenarioResults = []
+    total_interest: float = 0.0
+    monthly_interest_accumulator: float = 0.0
+    current_etf_value_iter = etf_initial
+    etf_growth_rate = etf_growth / 100.0
+    dividend_rate = dividend_yield / 100.0
+    net_dividend_multiplier = 1 - DIVIDEND_TAX_RATE
+
+    loan_paid_off = False
+    last_recorded_year = 0
+
+    for month in range(1, total_months + 1):
+        interest_this_month = 0.0
+        principal_paid_by_payment = 0.0
+
+        if not loan_paid_off and current_balance > 1e-2:
+            interest_this_month = current_balance * monthly_rate
+            monthly_interest_accumulator += interest_this_month
+            principal_paid_by_payment = fixed_payment - interest_this_month
+            principal_paid_by_payment = min(principal_paid_by_payment, current_balance)
+            current_balance -= principal_paid_by_payment
+
+            if current_balance <= 1e-2:
+                current_balance = 0.0
+                loan_paid_off = True
+
+        if month % 12 == 0:
+            year = month // 12
+            last_recorded_year = year
+            capital_growth_amount = current_etf_value_iter * etf_growth_rate
+            gross_dividend = current_etf_value_iter * dividend_rate
+            etf_value_after_growth = current_etf_value_iter + capital_growth_amount
+            net_dividend_used_for_loan = 0.0
+            etf_value_end_year = etf_value_after_growth
+
+            if not loan_paid_off:
+                net_dividend = gross_dividend * net_dividend_multiplier
+                net_dividend_used_for_loan = min(net_dividend, current_balance)
+                current_balance -= net_dividend_used_for_loan
+
+                if current_balance <= 1e-2:
+                    current_balance = 0.0
+                    loan_paid_off = True
+                    etf_value_end_year = etf_value_after_growth
+                else:
+                    etf_value_end_year = etf_value_after_growth
+            else:
+                etf_value_end_year = etf_value_after_growth + gross_dividend
+                net_dividend_used_for_loan = 0.0
+
+            pv = property_value(prop0, prop_growth, year)
+            net_equity = pv - current_balance + etf_value_end_year
+
+            results.append(SimulationResult(
+                Year=year,
+                PropertyValue=pv,
+                LoanBalance=current_balance,
+                MonthlyPayment=fixed_payment if current_balance > 1e-2 or not loan_paid_off else 0.0,
+                AnnualInterest=monthly_interest_accumulator,
+                ETFValue=etf_value_end_year,
+                ETFGrowth=capital_growth_amount,
+                GrossDividend=gross_dividend,
+                DividendIncome=net_dividend_used_for_loan,
+                NetEquity=net_equity
+            ))
+
+            current_etf_value_iter = etf_value_end_year
+            total_interest += monthly_interest_accumulator
+            monthly_interest_accumulator = 0.0
+
+    etf_value_for_fill = current_etf_value_iter
+    etf_growth_rate = etf_growth / 100.0
+    dividend_rate = dividend_yield / 100.0
+
+    start_fill_year = last_recorded_year + 1
+    end_fill_year = int(loan_years)
+
+    if loan_paid_off and start_fill_year <= end_fill_year:
+        for year in range(start_fill_year, end_fill_year + 1):
+            pv = property_value(prop0, prop_growth, year)
+            capital_growth_amount = etf_value_for_fill * etf_growth_rate
+            gross_dividend = etf_value_for_fill * dividend_rate
+            etf_value_for_fill += capital_growth_amount + gross_dividend
+            net_equity = pv + etf_value_for_fill
+
+            results.append(SimulationResult(
+                Year=year,
+                PropertyValue=pv,
+                LoanBalance=0.0,
+                MonthlyPayment=0.0,
+                AnnualInterest=0.0,
+                ETFValue=etf_value_for_fill,
+                ETFGrowth=capital_growth_amount,
+                GrossDividend=gross_dividend,
+                NetEquity=net_equity,
+                DividendIncome=0.0
+            ))
+
+    if results:
+        results[-1].TotalInterest = total_interest
+
+    return results
+
+class LoanDecisionGUI:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Loan and Investment Decision Program")
+        self.root.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1)
+        self.session_results: Dict[str, List[SimulationResult]] = {}
+
+        self.loan_years = tk.StringVar(value=DEFAULT_VALUES["DURATION"])
+        self.sv_prop0 = tk.StringVar(value=DEFAULT_VALUES["PROP_VALUE"])
+        self.sv_prop_growth = tk.StringVar(value=DEFAULT_VALUES["PROP_GROWTH"])
+        self.sv_init_own = tk.StringVar(value=DEFAULT_VALUES["INIT_OWN"])
+        self.sv_add_own = tk.StringVar(value=DEFAULT_VALUES["ADD_OWN"])
+        self.sv_annual_rate = tk.StringVar(value=DEFAULT_VALUES["ANNUAL_RATE"])
+        self.sv_etf_initial = tk.StringVar(value=DEFAULT_VALUES["ETF_INITIAL"])
+        self.sv_etf_growth_full = tk.StringVar(value=DEFAULT_VALUES["ETF_GROWTH_FULL"])
+        self.sv_etf_growth_div = tk.StringVar(value=DEFAULT_VALUES["ETF_GROWTH_DIV"])
+        self.sv_etf_dividend = tk.StringVar(value=DEFAULT_VALUES["ETF_DIVIDEND"])
+
+        self.main_frame = ttk.Frame(self.root, padding="10")
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
+        self.main_frame.rowconfigure(1, weight=1)
+        self.main_frame.columnconfigure(0, weight=1)
+
+        self.input_frame = ttk.LabelFrame(self.main_frame, text="Inputs", padding="10")
+        self.input_frame.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+        self.input_frame.columnconfigure(1, weight=1)
+
+        self.output_frame = ttk.LabelFrame(self.main_frame, text="Results", padding="10")
+        self.output_frame.grid(row=1, column=0, padx=5, pady=(5, 5), sticky="nsew")
+        self.output_frame.rowconfigure(0, weight=1)
+        self.output_frame.rowconfigure(1, weight=3)
+        self.output_frame.columnconfigure(0, weight=1)
+
+        self.create_input_widgets()
+        self.create_output_widgets()
+
+    def _add_input_row(self, label_text: str, string_var: tk.StringVar, row: int):
+        ttk.Label(self.input_frame, text=label_text).grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        entry = ttk.Entry(self.input_frame, textvariable=string_var)
+        entry.grid(row=row, column=1, sticky="ew", padx=5, pady=2)
+
+    def create_input_widgets(self):
+        row = 0
+        self._add_input_row("Property Initial Value (€):", self.sv_prop0, row); row += 1
+        self._add_input_row("Annual Property Growth (%):", self.sv_prop_growth, row); row += 1
+        self._add_input_row("Initial Own Contribution (€):", self.sv_init_own, row); row += 1
+        self._add_input_row("Additional Own Contribution (€):", self.sv_add_own, row); row += 1
+
+        ttk.Label(self.input_frame, text="Loan Duration (years):").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        loan_years_entry = ttk.Entry(self.input_frame, textvariable=self.loan_years)
+        loan_years_entry.grid(row=row, column=1, sticky="ew", padx=5, pady=2)
+        row += 1
+
+        self._add_input_row("Annual Interest Rate (%):", self.sv_annual_rate, row); row += 1
+        self._add_input_row("Initial ETF Investment (€):", self.sv_etf_initial, row); row += 1
+        self._add_input_row("ETF Growth Rate Scenario 2 (%):", self.sv_etf_growth_full, row); row += 1
+        self._add_input_row("ETF Growth Rate Scenario 3 (%):", self.sv_etf_growth_div, row); row += 1
+        self._add_input_row("ETF Dividend Yield (%):", self.sv_etf_dividend, row); row += 1
+
+        ttk.Label(self.input_frame, text="Select Scenarios:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
+        self.scenario1_var = tk.IntVar(value=1)
+        self.scenario2_var = tk.IntVar(value=1)
+        self.scenario3_var = tk.IntVar(value=1)
+        cb_frame = ttk.Frame(self.input_frame)
+        cb_frame.grid(row=row, column=1, sticky="w")
+        ttk.Checkbutton(cb_frame, text="1: Loan Reduction", variable=self.scenario1_var).pack(anchor="w")
+        ttk.Checkbutton(cb_frame, text="2: ETF Reinvestment", variable=self.scenario2_var).pack(anchor="w")
+        ttk.Checkbutton(cb_frame, text="3: ETF Dividend Loan Reduction", variable=self.scenario3_var).pack(anchor="w")
+        row += 1
+
+        ttk.Label(self.input_frame, text="Display Options:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
+        self.display_option_var = tk.IntVar(value=1)
+        rb_frame = ttk.Frame(self.input_frame)
+        rb_frame.grid(row=row, column=1, sticky="w")
+        ttk.Radiobutton(rb_frame, text="Final Result", variable=self.display_option_var, value=1).pack(anchor="w")
+        ttk.Radiobutton(rb_frame, text="Years 1, 5, 10, 20, 30", variable=self.display_option_var, value=2).pack(anchor="w")
+        ttk.Radiobutton(rb_frame, text="Every Year", variable=self.display_option_var, value=3).pack(anchor="w")
+        row += 1
+
+        action_frame = ttk.Frame(self.input_frame)
+        action_frame.grid(row=row, column=0, columnspan=2, pady=10)
+        self.btn_calculate = ttk.Button(action_frame, text="Calculate", command=self.calculate)
+        self.btn_calculate.pack(side=tk.LEFT, padx=5)
+        self.btn_new_calc = ttk.Button(action_frame, text="New Calculation", command=self.new_calculation)
+        self.btn_new_calc.pack(side=tk.LEFT, padx=5)
+        self.btn_save_results = ttk.Button(action_frame, text="Save Results", command=self.save_results_ui, state=tk.DISABLED)
+        self.btn_save_results.pack(side=tk.LEFT, padx=5)
+
+    def create_output_widgets(self):
+        text_frame = ttk.Frame(self.output_frame)
+        text_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+
+        self.text_results = tk.Text(text_frame, height=10, width=80, wrap="none", borderwidth=0)
+        text_scrollbar_y = ttk.Scrollbar(text_frame, orient="vertical", command=self.text_results.yview)
+        text_scrollbar_x = ttk.Scrollbar(text_frame, orient="horizontal", command=self.text_results.xview)
+        self.text_results.configure(yscrollcommand=text_scrollbar_y.set, xscrollcommand=text_scrollbar_x.set)
+
+        self.text_results.grid(row=0, column=0, sticky="nsew")
+        text_scrollbar_y.grid(row=0, column=1, sticky="ns")
+        text_scrollbar_x.grid(row=1, column=0, sticky="ew")
+
+        self.graph_frame = ttk.Frame(self.output_frame)
+        self.graph_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+    def _get_float_input(self, string_var: tk.StringVar, label_text: str) -> float:
+        try:
+            value_str = string_var.get().replace(',', '.')
+            return float(value_str)
+        except ValueError:
+            raise ValueError(f"Invalid input for '{label_text}': Please enter a number.")
+        except Exception as e:
+            raise ValueError(f"Error reading input for '{label_text}': {e}")
+
+    def calculate(self):
+        self.new_calculation()
+        try:
+            prop0 = self._get_float_input(self.sv_prop0, "Property Initial Value")
+            prop_growth = self._get_float_input(self.sv_prop_growth, "Annual Property Growth")
+            init_own = self._get_float_input(self.sv_init_own, "Initial Own Contribution")
+            add_own = self._get_float_input(self.sv_add_own, "Additional Own Contribution")
+            loan_duration = self._get_float_input(self.loan_years, "Loan Duration")
+            annual_rate = self._get_float_input(self.sv_annual_rate, "Annual Interest Rate")
+            etf_initial = self._get_float_input(self.sv_etf_initial, "Initial ETF Investment")
+            etf_growth_full = self._get_float_input(self.sv_etf_growth_full, "ETF Growth Rate Scenario 2")
+            etf_growth_div = self._get_float_input(self.sv_etf_growth_div, "ETF Growth Rate Scenario 3")
+            etf_dividend = self._get_float_input(self.sv_etf_dividend, "ETF Dividend Yield")
+
+            if loan_duration <= 0 or not float(loan_duration).is_integer():
+                raise ValueError("Loan duration must be a positive integer.")
+            if prop0 <= 0:
+                raise ValueError("Property initial value must be positive.")
+            if annual_rate < 0:
+                raise ValueError("Annual interest rate cannot be negative.")
+            if etf_growth_full < -100 or etf_growth_div < -100:
+                raise ValueError("ETF growth rate cannot be less than -100%.")
+            if etf_dividend < 0:
+                raise ValueError("ETF dividend yield cannot be negative.")
+
+            full_loan = prop0 - init_own - PROCESSING_FEE
+            if full_loan < 0:
+                messagebox.showwarning("Warning", f"Calculated loan amount ({full_loan:,.0f}€) is negative (own contribution + fee > property value). Loan set to 0€.")
+                full_loan = 0.0
+
+        except ValueError as e:
+            messagebox.showerror("Input Error", str(e))
+            return
+        except Exception as e:
+            messagebox.showerror("Unexpected Error", f"An unexpected error occurred: {e}")
+            logging.error(f"Unexpected error: {e}", exc_info=True)
+            return
+
+        selected_scenarios: List[Tuple[str, ScenarioResults]] = []
+        try:
+            if self.scenario1_var.get() == 1:
+                res1 = simulate_scenario_1(loan_duration, prop0, prop_growth, full_loan, add_own, annual_rate)
+                if res1: selected_scenarios.append(("Scenario 1", res1))
+            if self.scenario2_var.get() == 1:
+                res2 = simulate_scenario_2(loan_duration, prop0, prop_growth, full_loan, annual_rate, etf_initial, etf_growth_full, etf_dividend)
+                if res2: selected_scenarios.append(("Scenario 2", res2))
+            if self.scenario3_var.get() == 1:
+                res3 = simulate_scenario_3(loan_duration, prop0, prop_growth, full_loan, annual_rate, etf_initial, etf_growth_div, etf_dividend)
+                if res3: selected_scenarios.append(("Scenario 3", res3))
+
+        except Exception as e:
+            messagebox.showerror("Calculation Error", f"An error occurred during calculation: {e}")
+            logging.error(f"Calculation error: {e}", exc_info=True)
+            return
+
+        if not selected_scenarios:
+            self.text_results.configure(state='normal')
+            self.text_results.insert(tk.END, "Please select at least one scenario and check your inputs.\nNo results generated.\n")
+            self.text_results.configure(state='disabled')
+            return
+
+        self.session_results = {name: copy.deepcopy(results_list) for name, results_list in selected_scenarios}
+
+        self.display_results(selected_scenarios)
+        self.plot_results(selected_scenarios)
+        self.btn_save_results.config(state=tk.NORMAL)
+
+    def display_results(self, scenario_data: List[Tuple[str, List[SimulationResult]]]):
+        display_option = self.display_option_var.get()
+        output_text = ""
+        headers = ["Year", "Property Value", "Loan Balance", "Monthly Payment", "Annual Interest", "ETF Value", "ETF Growth", "Gross Dividend", "Net Equity"]
+        fmt = "{:<6} {:>15} {:>15} {:>12} {:>15} {:>15} {:>12} {:>12} {:>18}\n"
+        header_line = fmt.format(*headers)
+        separator = "-" * (len(header_line.rstrip())) + "\n"
+
+        if display_option in [2, 3]:
+            for name, results_list in scenario_data:
+                if not results_list: continue
+                output_text += f"\n{name}:\n" + header_line + separator
+                total_interest = results_list[-1].TotalInterest if results_list and results_list[-1].TotalInterest is not None else 0.0
+                years_in_results = {r.Year for r in results_list}
+
+                loan_years_str = self.loan_years.get()
+                loan_term_int = 0
+                if loan_years_str:
+                    try:
+                        loan_term_int = int(float(loan_years_str))
+                    except (ValueError, TypeError):
+                        logging.warning(f"Could not convert loan term '{loan_years_str}' to integer for display years.")
+
+                target_years = {1, 5, 10, 20}
+                if loan_term_int > 0:
+                    target_years.add(loan_term_int)
+                if results_list:
+                    target_years.add(results_list[-1].Year)
+
+                if display_option == 2:
+                    years_to_show = sorted(years_in_results.intersection(target_years))
+                    if results_list and results_list[-1].Year not in years_to_show:
+                        years_to_show.append(results_list[-1].Year)
+                        years_to_show = sorted(years_to_show)
+                    rows_to_show = [r for r in results_list if r.Year in years_to_show]
+                else:
+                    rows_to_show = results_list
+
+                for r in rows_to_show:
+                    output_text += fmt.format(
+                        r.Year,
+                        f"{r.PropertyValue:,.0f}".replace(",", " "),
+                        f"{r.LoanBalance:,.0f}".replace(",", " "),
+                        f"{r.MonthlyPayment:,.0f}".replace(",", " "),
+                        f"{r.AnnualInterest:,.0f}".replace(",", " "),
+                        f"{r.ETFValue:,.0f}".replace(",", " "),
+                        f"{r.ETFGrowth:,.0f}".replace(",", " "),
+                        f"{r.GrossDividend:,.0f}".replace(",", " "),
+                        f"{r.NetEquity:,.0f}".replace(",", " ")
+                    )
+                output_text += separator
+                total_interest_str = f"{total_interest:,.0f}".replace(",", " ") if total_interest is not None else "N/A"
+                footer_cols = ["Total", "", "", "", total_interest_str, "", "", "", ""]
+                output_text += fmt.format(*footer_cols)
+                output_text += "\n"
+
+        else:
+            for name, results_list in scenario_data:
+                if not results_list: continue
+                last = results_list[-1]
+                total_interest = last.TotalInterest if last.TotalInterest is not None else 0.0
+                output_text += f"{name} - Final Result (Year {last.Year}):\n"
+                output_text += f"  Property Value: {last.PropertyValue:,.2f} €\n".replace(",", " ")
+                output_text += f"  Loan Balance: {last.LoanBalance:,.2f} €\n".replace(",", " ")
+                output_text += f"  Monthly Payment (last): {last.MonthlyPayment:,.2f} €\n".replace(",", " ")
+                output_text += f"  ETF Value: {last.ETFValue:,.2f} €\n".replace(",", " ")
+                output_text += f"  ETF Growth (last year): {last.ETFGrowth:,.2f} €\n".replace(",", " ")
+                output_text += f"  Gross Dividend (last year): {last.GrossDividend:,.2f} €\n".replace(",", " ")
+                output_text += f"  Net Equity: {last.NetEquity:,.2f} €\n".replace(",", " ")
+                output_text += "----------------------------------------\n"
+                total_interest_str = f"{total_interest:,.2f} €".replace(",", " ") if total_interest is not None else "N/A"
+                output_text += f"  Total Interest Over Period: {total_interest_str}\n\n"
+
+        self.text_results.configure(state='normal')
+        self.text_results.delete("1.0", tk.END)
+        self.text_results.insert(tk.END, output_text)
+        self.text_results.configure(state='disabled')
+
+    def plot_results(self, scenario_data: List[Tuple[str, List[SimulationResult]]]):
+        for widget in self.graph_frame.winfo_children():
+            widget.destroy()
+
+        if not any(res for _, res in scenario_data):
+            ttk.Label(self.graph_frame, text="No data to plot.").pack(padx=10, pady=10)
+            return
+
+        fig, axs = plt.subplots(3, 1, figsize=(8, 8), sharex=True, constrained_layout=True)
+        all_etf_growth_values = []
+        all_years_simulated = []
+
+        for name, results_list in scenario_data:
+            if not results_list: continue
+            years = [r.Year for r in results_list]
+            loan_balances = [r.LoanBalance for r in results_list]
+            net_equities = [r.NetEquity for r in results_list]
+            etf_growths = [r.ETFGrowth for r in results_list]
+
+            all_years_simulated.extend(years)
+            all_etf_growth_values.extend(etf_growths)
+
+            axs[0].plot(years, loan_balances, marker=".", linestyle='-', label=name)
+            axs[1].plot(years, net_equities, marker=".", linestyle='-', label=name)
+            axs[2].plot(years, etf_growths, marker=".", linestyle='-', label=name)
+
+        axs[0].set_title("Loan Balance Over Years")
+        axs[0].set_ylabel("Loan Balance (€)")
+        axs[0].ticklabel_format(style='plain', axis='y')
+        axs[0].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format(int(x), ',').replace(",", " ")))
+        axs[0].legend()
+        axs[0].grid(True, linestyle='--', alpha=0.6)
+
+        axs[1].set_title("Net Equity Over Years")
+        axs[1].set_ylabel("Net Equity (€)")
+        axs[1].ticklabel_format(style='plain', axis='y')
+        axs[1].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format(int(x), ',').replace(",", " ")))
+        axs[1].legend()
+        axs[1].grid(True, linestyle='--', alpha=0.6)
+
+        axs[2].set_title("Annual ETF Capital Growth")
+        axs[2].set_xlabel("Year")
+        axs[2].set_ylabel("Capital Growth (€)")
+        axs[2].ticklabel_format(style='plain', axis='y')
+        axs[2].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format(int(x), ',').replace(",", " ")))
+        axs[2].legend()
+        axs[2].grid(True, linestyle='--', alpha=0.6)
+
+        if all_etf_growth_values:
+            min_growth = min(all_etf_growth_values)
+            max_growth = max(all_etf_growth_values)
+            if abs(max_growth - min_growth) < 1e-6:
+                axs[2].set_ylim(min_growth - 1, max_growth + 1)
+            else:
+                padding = (max_growth - min_growth) * 0.05
+                axs[2].set_ylim(min_growth - padding, max_growth + padding)
+        else:
+            axs[2].set_ylim(-1000, 1000)
+
+        if all_years_simulated:
+            min_year = min(all_years_simulated)
+            max_year = max(all_years_simulated)
+            axs[2].xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+            axs[2].set_xlim(min_year - 0.5, max_year + 0.5)
+
+        canvas = FigureCanvasTkAgg(fig, master=self.graph_frame)
+        canvas.draw()
+        canvas_widget = canvas.get_tk_widget()
+        canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def new_calculation(self):
+        self.text_results.configure(state='normal')
+        self.text_results.delete("1.0", tk.END)
+        self.text_results.configure(state='disabled')
+
+        for widget in self.graph_frame.winfo_children():
+            widget.destroy()
+
+        self.session_results = {}
+        self.btn_save_results.config(state=tk.DISABLED)
+
+    def save_results_ui(self):
+        if not self.session_results:
+            messagebox.showwarning("Save Results", "No calculation results to save. Please run 'Calculate' first.")
+            return
+
+        initial_filename = "loan_investment_simulation.csv"
+        file_path = filedialog.asksaveasfilename(
+            initialfile=initial_filename,
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Save Simulation Results"
+        )
+
+        if not file_path:
+            return
+
+        combined_rows: List[Dict[str, Any]] = []
+        fieldnames = ["Scenario", "Year", "PropertyValue", "LoanBalance", "MonthlyPayment",
+                      "AnnualInterest", "ETFValue", "ETFGrowth", "GrossDividend",
+                      "DividendIncome", "NetEquity"]
+
+        for scenario_name, results_list in self.session_results.items():
+            if not results_list: continue
+            total_interest = results_list[-1].TotalInterest if results_list and results_list[-1].TotalInterest is not None else 0.0
+
+            for r in results_list:
+                row_dict = asdict(r)
+                row_dict["Scenario"] = scenario_name
+                for key, value in row_dict.items():
+                    if isinstance(value, (int, float)):
+                        row_dict[key] = round(value)
+                row_dict.pop("TotalInterest", None)
+                combined_rows.append(row_dict)
+
+            combined_rows.append({
+                "Scenario": scenario_name,
+                "Year": "Total",
+                "PropertyValue": "",
+                "LoanBalance": "",
+                "MonthlyPayment": "",
+                "AnnualInterest": round(total_interest) if total_interest is not None else "",
+                "ETFValue": "",
+                "ETFGrowth": "",
+                "GrossDividend": "",
+                "DividendIncome": "",
+                "NetEquity": ""
+            })
+
+        try:
+            with open(file_path, mode="w", newline="", encoding="utf-8-sig") as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames, restval="", extrasaction='ignore', delimiter=';')
+                writer.writeheader()
+                for row_data in combined_rows:
+                    row_to_write = {field: row_data.get(field, "") for field in fieldnames}
+                    writer.writerow(row_to_write)
+
+            self.text_results.configure(state='normal')
+            self.text_results.insert(tk.END, f"\nResults saved to file:\n{file_path}\n")
+            self.text_results.configure(state='disabled')
+            messagebox.showinfo("Save Successful", f"Results saved to file:\n{file_path}")
+
+        except (IOError, PermissionError, csv.Error) as e:
+            error_msg = f"Error saving to file {file_path}:\n{e}\n\nPlease ensure the file is not open in another program and you have write permissions."
+            messagebox.showerror("Save Error", error_msg)
+        except Exception as e:
+            error_msg = f"Unexpected error while saving:\n{e}"
+            logging.error(f"Unexpected error: {e}", exc_info=True)
+            messagebox.showerror("Save Error", error_msg)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+
+    style = ttk.Style()
+    try:
+        if 'clam' in style.theme_names():
+            style.theme_use('clam')
+        elif 'vista' in style.theme_names():
+            style.theme_use('vista')
+        elif 'aqua' in style.theme_names():
+            style.theme_use('aqua')
+    except tk.TclError:
+        logging.warning("Could not set preferred theme, using default.")
+
+    default_font = tkfont.nametofont("TkDefaultFont")
+    font_size = default_font.cget("size")
+    new_size = max(10, int(font_size * 1.1))
+    default_font.configure(size=new_size)
+    root.option_add("*Font", default_font)
+    style.configure("TLabel", font=default_font)
+    style.configure("TButton", font=default_font)
+    style.configure("TCheckbutton", font=default_font)
+    style.configure("TRadiobutton", font=default_font)
+    style.configure("TEntry", font=default_font)
+    style.configure("TLabelFrame.Label", font=default_font)
+
+    root.minsize(750, 600)
+
+    app = LoanDecisionGUI(root)
+    root.mainloop()
